@@ -41,32 +41,48 @@ interface Stats {
 export default function DashboardPage() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [recentOrders, setRecentOrders] = useState<OrderListItem[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [statsLoading, setStatsLoading] = useState(true);
+  const [ordersLoading, setOrdersLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [animKey, setAnimKey] = useState(0);
 
-  const fetchData = async (isManual = false) => {
-    if (isManual) setRefreshing(true);
+  const fetchRecentOrders = async () => {
     try {
-      const [statsRes, ordersRes] = await Promise.all([
-        fetch('/api/stats'),
-        fetch('/api/orders?limit=6'),
-      ]);
-      const statsData = await statsRes.json();
-      const ordersData = await ordersRes.json();
-      setStats(statsData);
-      setRecentOrders(ordersData.orders ?? []);
+      const res = await fetch('/api/orders?limit=6');
+      const data = await res.json();
+      setRecentOrders(data.orders ?? []);
     } catch (err) {
-      console.error('Failed to load dashboard data', err);
+      console.error('Failed to load recent orders', err);
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      setOrdersLoading(false);
     }
   };
 
+  const fetchStats = async (isManual = false) => {
+    try {
+      const res = await fetch(`/api/stats${isManual ? '?refresh=true' : ''}`);
+      const data = await res.json();
+      setStats(data);
+    } catch (err) {
+      console.error('Failed to load stats', err);
+    } finally {
+      setStatsLoading(false);
+    }
+  };
+
+  const refreshAll = async () => {
+    setRefreshing(true);
+    await Promise.allSettled([fetchRecentOrders(), fetchStats(true)]);
+    setRefreshing(false);
+  };
+
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(() => fetchData(), 30_000);
+    fetchRecentOrders();
+    fetchStats();
+    const interval = setInterval(() => {
+      fetchRecentOrders();
+      fetchStats();
+    }, 30_000);
     return () => clearInterval(interval);
   }, []);
 
@@ -105,12 +121,12 @@ export default function DashboardPage() {
           </div>
 
           <button
-            onClick={() => fetchData(true)}
-            disabled={refreshing}
+            onClick={refreshAll}
+            disabled={refreshing || statsLoading || ordersLoading}
             className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-white dark:bg-slate-800 border border-gray-200/80 dark:border-slate-700 text-xs font-semibold text-gray-700 dark:text-slate-300 hover:bg-gray-50 dark:hover:bg-slate-700 active:scale-95 transition-all shadow-sm shrink-0"
             title="Refresh live data"
           >
-            <RefreshCw className={`w-3.5 h-3.5 ${refreshing ? 'animate-spin text-blue-600' : ''}`} />
+            <RefreshCw className={`w-3.5 h-3.5 ${refreshing || statsLoading ? 'animate-spin text-blue-600' : ''}`} />
             <span className="hidden sm:inline">Refresh</span>
           </button>
         </div>
@@ -119,7 +135,7 @@ export default function DashboardPage() {
         <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4 mb-5">
           <StatsCard
             label="Orders Today"
-            value={loading ? '—' : stats?.ordersToday ?? 0}
+            value={statsLoading ? '—' : stats?.ordersToday ?? 0}
             icon={ShoppingCart}
             iconColor="text-blue-600 dark:text-blue-400"
             iconBg="bg-blue-50 dark:bg-blue-950/60"
@@ -127,7 +143,7 @@ export default function DashboardPage() {
           />
           <StatsCard
             label="Processing"
-            value={loading ? '—' : stats?.processingCount ?? stats?.pendingCount ?? 0}
+            value={statsLoading ? '—' : stats?.processingCount ?? stats?.pendingCount ?? 0}
             icon={Clock}
             iconColor="text-amber-600 dark:text-amber-400"
             iconBg="bg-amber-50 dark:bg-amber-950/60"
@@ -135,7 +151,7 @@ export default function DashboardPage() {
           />
           <StatsCard
             label="Revenue Today"
-            value={loading ? '—' : formatCurrency(stats?.revenueToday ?? 0)}
+            value={statsLoading ? '—' : formatCurrency(stats?.revenueToday ?? 0)}
             icon={IndianRupee}
             iconColor="text-emerald-600 dark:text-emerald-400"
             iconBg="bg-emerald-50 dark:bg-emerald-950/60"
@@ -143,7 +159,7 @@ export default function DashboardPage() {
           />
           <StatsCard
             label="Revenue (7 Days)"
-            value={loading ? '—' : formatCurrency(stats?.revenueWeek ?? 0)}
+            value={statsLoading ? '—' : formatCurrency(stats?.revenueWeek ?? 0)}
             icon={TrendingUp}
             iconColor="text-indigo-600 dark:text-indigo-400"
             iconBg="bg-indigo-50 dark:bg-indigo-950/60"
@@ -152,7 +168,7 @@ export default function DashboardPage() {
         </div>
 
         {/* Analytics Chart with Dual Wave (Blue = Active, Red = Failed) & Smooth Loop */}
-        {!loading && stats?.ordersByDay && stats.ordersByDay.length > 0 && (
+        {!statsLoading && stats?.ordersByDay && stats.ordersByDay.length > 0 && (
           <div className="bg-white dark:bg-slate-800/90 rounded-2xl border border-gray-100 dark:border-slate-800 p-4 sm:p-5 mb-5 shadow-sm">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
               <div>
@@ -277,7 +293,7 @@ export default function DashboardPage() {
           </div>
 
           <div className="space-y-2.5">
-            {loading ? (
+            {ordersLoading ? (
               Array.from({ length: 4 }).map((_, i) => <SkeletonCard key={i} />)
             ) : recentOrders.length === 0 ? (
               <div className="text-center py-10 bg-white dark:bg-slate-800 rounded-2xl border border-gray-100 dark:border-slate-800 text-sm text-gray-500">

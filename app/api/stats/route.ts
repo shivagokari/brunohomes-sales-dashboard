@@ -1,7 +1,10 @@
-import { NextResponse } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { getWcConfig } from '@/lib/wc'
 
 export const dynamic = 'force-dynamic'
+
+// 30-second in-memory cache to make dashboard load blazing fast
+let statsCache: { data: any; expiresAt: number } | null = null
 
 // IST start-of-day in UTC
 function istStartOfDay(): string {
@@ -34,17 +37,24 @@ async function wcFetch(path: string, params: URLSearchParams) {
   return { data: await res.json(), total: parseInt(res.headers.get('X-WP-Total') || '0') }
 }
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   try {
+    const isManual = req.nextUrl.searchParams.get('refresh') === 'true'
+    const now = Date.now()
+
+    // Return cached stats if valid and not manually forced
+    if (!isManual && statsCache && statsCache.expiresAt > now) {
+      return NextResponse.json(statsCache.data)
+    }
+
     const todayStart = istStartOfDay()
     const weekStart  = nDaysAgoIST(6)
     const chartStart = nDaysAgoIST(13)
 
-    // Parallel: today's orders, pending count, processing count
-    const [todayRes, pendingRes, processingRes, chartRes] = await Promise.all([
-      wcFetch('/orders', new URLSearchParams({ after: todayStart, per_page: '100', status: 'any' })),
-      wcFetch('/orders', new URLSearchParams({ status: 'pending', per_page: '1' })),
+    // Execute only 3 parallel queries: processing count, pending count, and the last 14 days orders
+    const [processingRes, pendingRes, chartRes] = await Promise.all([
       wcFetch('/orders', new URLSearchParams({ status: 'processing', per_page: '1' })),
+      wcFetch('/orders', new URLSearchParams({ status: 'pending', per_page: '1' })),
       wcFetch('/orders', new URLSearchParams({
         after:    chartStart,
         per_page: '100',
@@ -54,28 +64,11 @@ export async function GET() {
       })),
     ])
 
-    // Revenue today (exclude cancelled/failed)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const todayOrders: any[] = todayRes.data
-    const revenueToday = todayOrders
-      .filter((o) => !['cancelled', 'failed', 'refunded', 'trash'].includes(o.status))
-      .reduce((sum, o) => sum + parseFloat(o.total || '0'), 0)
-
-    // Revenue this week
-    const weekRes = await wcFetch('/orders', new URLSearchParams({
-      after: weekStart, per_page: '100', status: 'any',
-    }))
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const weekOrders: any[] = weekRes.data
-    const revenueWeek = weekOrders
-      .filter((o) => !['cancelled', 'failed', 'refunded', 'trash'].includes(o.status))
-      .reduce((sum, o) => sum + parseFloat(o.total || '0'), 0)
-
-    // Orders by day (last 14 days)
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const chartOrders: any[] = chartRes.data
-    const dayMap: Record<string, { count: number; failed: number; revenue: number }> = {}
 
+    // 14-day map for chart
+    const dayMap: Record<string, { count: number; failed: number; revenue: number }> = {}
     for (let i = 13; i >= 0; i--) {
       const d = new Date()
       d.setDate(d.getDate() - i)
@@ -83,30 +76,67 @@ export async function GET() {
       dayMap[key] = { count: 0, failed: 0, revenue: 0 }
     }
 
+    let ordersToday = 0
+    let revenueToday = 0
+    let revenueWeek = 0
+
+    const todayIsoDate = todayStart.split('T')[0]
+    const weekStartTime = new Date(weekStart).getTime()
+    const todayStartTime = new Date(todayStart).getTime()
+
     for (const o of chartOrders) {
-      const key = o.date_created?.split('T')[0]
+      const orderDateStr = o.date_created || ''
+      const orderTime = new Date(orderDateStr).getTime()
+      const key = orderDateStr.split('T')[0]
+      const isFailed = ['failed', 'cancelled'].includes((o.status || '').toLowerCase())
+      const isRevenueEligible = !['cancelled', 'failed', 'refunded', 'trash'].includes((o.status || '').toLowerCase())
+      const amount = parseFloat(o.total || '0')
+
+      // Populate 14-day chart
       if (key && dayMap[key] !== undefined) {
-        const isFailed = ['failed', 'cancelled'].includes((o.status || '').toLowerCase())
         if (isFailed) {
           dayMap[key].failed++
         } else {
           dayMap[key].count++
         }
-        if (!['cancelled', 'failed', 'refunded', 'trash'].includes(o.status)) {
-          dayMap[key].revenue += parseFloat(o.total || '0')
+        if (isRevenueEligible) {
+          dayMap[key].revenue += amount
+        }
+      }
+
+      // Today's metrics
+      if (orderTime >= todayStartTime || key === todayIsoDate) {
+        ordersToday++
+        if (isRevenueEligible) {
+          revenueToday += amount
+        }
+      }
+
+      // Week's metrics
+      if (orderTime >= weekStartTime) {
+        if (isRevenueEligible) {
+          revenueWeek += amount
         }
       }
     }
 
-    return NextResponse.json({
-      ordersToday:     todayRes.total || todayOrders.length,
+    const result = {
+      ordersToday,
       pendingCount:    pendingRes.total,
       processingCount: processingRes.total,
       completedCount:  0,
       revenueToday,
       revenueWeek,
       ordersByDay: Object.entries(dayMap).map(([date, v]) => ({ date, ...v })),
-    })
+    }
+
+    // Cache for 30 seconds
+    statsCache = {
+      data: result,
+      expiresAt: now + 30_000,
+    }
+
+    return NextResponse.json(result)
   } catch (error) {
     console.error('[GET /api/stats]', error)
     return NextResponse.json({ error: 'Failed to fetch stats from WooCommerce' }, { status: 500 })
